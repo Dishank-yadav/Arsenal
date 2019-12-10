@@ -1,0 +1,499 @@
+/*dishank
+ * =====================================================================================
+ *
+ * Registration number: 
+ * Title: Arsenal of Hardware Prefetchers
+ * Authors: Dishank Yadav (Indian Institute of Technology, Kharagpur) - dishankyadav96@gmail.com
+ *   Chaitanya Paikara (Indian Institute of Technology, Kharagpur) - chaitanya1445@gmail.com
+ *   Biswabandan Panda (Indian Institute of Technology, Kanpur) - biswa.uce@gmail.com
+ * =====================================================================================
+*/
+
+#include <stdio.h>
+#include <assert.h>
+#include <string.h>
+#include "cache.h"
+#include <stdlib.h>
+#include <bits/stdc++.h>
+#include "MLOP_class.cpp"
+#include "SKID.h"
+#include "Bingo_class.cpp"
+#include "bloom_filter.hpp"
+
+void l2_cache_fill_stat(int cpu_num, unsigned long long int addr, int set, int way, int prefetch, unsigned long long int evicted_addr)
+{
+
+}
+
+
+sbc sandbox[NUM_CPUS];
+int MAX_DEGREE;     
+int MAX_DEGREE_2;
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * SKID
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+void skid_l1d_prefetcher_final_stats()
+{
+}
+
+void skid_l1d_prefetcher_initialize()
+{
+  std::cout << "L1D N-SKID Prefetcher" << std::endl;
+  std::cout << "[StepTable.size=" << StepTableSize << ", TargetTable.size=" << TargetTableSize << ", RRT.size=" << RecentRequestTableSize << std::endl;
+  std::cout << "[TargetTable.entry.size=" << TargetTable_TargetPerEntry << ", DelayQueue.size=" << DELAY_QUEUE_SIZE << ", Delay=" << DELAY_TIME << "]" << std::endl;
+}
+
+void skid_l1d_prefetcher_operate( CACHE * temp, uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, int mode, int cpu, int deg )
+{
+  pCache = temp;
+  const bool prefetch_hit = ::prefetch_bit_operate(RawAddr(addr), cache_hit);
+  ::delay_queue_operate();
+  ::operate(RawAddr(addr), PC(ip), cache_hit, prefetch_hit, sandbox, mode);
+}
+
+void skid_l1d_prefetcher_cache_fill( CACHE * temp, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in )
+{
+  pCache = temp;
+  ::meta_cache[pCache->cpu].at(set).at(way) = ::make_L1D_tag(RawAddr(addr));
+  ::prefetch_bit[pCache->cpu].at(set).at(way) = static_cast<bool>(prefetch);
+  ::delay_queue_operate();
+  ::cache_fill(RawAddr(addr), prefetch);
+}
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * end of SKID
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * Bingo
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+void Bingo_l1d_prefetcher_initialize() {
+    /*=== Bingo Settings ===*/
+    const int REGION_SIZE = 2 * 1024;  /* size of spatial region = 2KB */
+    const int PC_WIDTH = 16;           /* number of PC bits used in PHT */
+    const int MIN_ADDR_WIDTH = 5;      /* number of Address bits used for PC+Offset matching */
+    const int MAX_ADDR_WIDTH = 16;     /* number of Address bits used for PC+Address matching */
+    const int FT_SIZE = 64;            /* size of filter table */
+    const int AT_SIZE = 128;           /* size of accumulation table */
+    const int PHT_SIZE = 8 * 1024;     /* size of pattern history table (PHT) */
+    const int PHT_WAYS = 16;           /* associativity of PHT */
+    const int PF_STREAMER_SIZE = 128;  /* size of prefetch streamer */
+    /*======================*/
+
+    /* number of PHT sets must be a power of 2 */
+    // assert(__builtin_popcount(PHT_SIZE / PHT_WAYS) == 1);
+
+    /* construct prefetcher for all cores */
+    // assert(PAGE_SIZE % REGION_SIZE == 0);
+    L1D_PREF_Bingo::prefetchers = vector<L1D_PREF_Bingo::Bingo>(
+        NUM_CPUS, L1D_PREF_Bingo::Bingo(REGION_SIZE >> LOG2_BLOCK_SIZE, MIN_ADDR_WIDTH, MAX_ADDR_WIDTH, PC_WIDTH, FT_SIZE,
+                      AT_SIZE, PHT_SIZE, PHT_WAYS, PF_STREAMER_SIZE, L1D_PREF_Bingo::DEBUG_LEVEL));
+}
+
+void Bingo_l1d_prefetcher_operate(CACHE * temp, uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, int mode, int cpu, int deg) {
+    if (L1D_PREF_Bingo::DEBUG_LEVEL >= 2) {
+        cerr << "CACHE::l1d_prefetcher_operate(addr=0x" << hex << addr << ", ip=0x" << ip << ", cache_hit=" << dec
+             << (int)cache_hit << ", type=" << (int)type << ")" << dec << endl;
+        cerr << "[CACHE::l1d_prefetcher_operate] CACHE{core=" << cpu << ", NAME=" << temp->NAME << "}" << dec
+             << endl;
+    }
+
+    if (type != LOAD)
+        return;
+
+    uint64_t block_number = addr >> LOG2_BLOCK_SIZE;
+
+    /* update BINGO with most recent LOAD access */
+    L1D_PREF_Bingo::prefetchers[cpu].access(block_number, ip);
+
+    /* issue prefetches */
+    //cout << "mode1 =  " << mode <<endl; //dishank_remove
+    L1D_PREF_Bingo::prefetchers[cpu].prefetch(temp, block_number, sandbox, mode);
+
+    if (L1D_PREF_Bingo::DEBUG_LEVEL >= 3) {
+        L1D_PREF_Bingo::prefetchers[cpu].log();
+        cerr << "=======================================" << dec << endl;
+    }
+}
+
+void Bingo_l1d_prefetcher_cache_fill(CACHE * temp, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in) {
+    uint64_t evicted_block_number = evicted_addr >> LOG2_BLOCK_SIZE;
+
+    if (temp->block[set][way].valid == 0)
+        return; /* no eviction */
+
+    /* inform all sms modules of the eviction */
+    for (int i = 0; i < NUM_CPUS; i += 1)
+        L1D_PREF_Bingo::prefetchers[i].eviction(evicted_block_number);
+}
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * end of Bingo
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * MLOP 
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+void mlop_l1d_prefetcher_initialize(CACHE * temp) {
+    /*=== MLOP Settings ===*/
+    const int BLOCKS_IN_CACHE = (temp->NUM_SET) * (temp->NUM_WAY);
+    const int BLOCKS_IN_ZONE = PAGE_SIZE / BLOCK_SIZE;
+    const int AMT_SIZE = 32 * BLOCKS_IN_CACHE / BLOCKS_IN_ZONE; /* size of access map table */
+
+    /* maximum possible prefetch degree (the actual prefetch degree is usually much smaller) */
+    const int PREFETCH_DEGREE = 16;
+
+    /* number of score updates before selecting prefetch offsets (thus, it is also the maximum possible score) */
+    const int NUM_UPDATES = 500;
+
+    /* prefetch offsets with `score >= LX_THRESH * NUM_UPDATES` into LX */
+    const double L1D_THRESH = 0.40; 
+    const double L2C_THRESH = 0.30;
+    const double LLC_THRESH = 2.00; /* off */
+    /*======================*/
+
+    /* construct prefetcher for all cores */
+    L1D_PREF::prefetchers =
+        vector<L1D_PREF::MLOP>(NUM_CPUS, L1D_PREF::MLOP(BLOCKS_IN_ZONE, AMT_SIZE, PREFETCH_DEGREE, NUM_UPDATES,
+                                              L1D_THRESH, L2C_THRESH, LLC_THRESH, L1D_PREF::DEBUG_LEVEL));
+}
+
+void mlop_l1d_prefetcher_operate(CACHE * temp, uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, int mode, int cpu, int deg) {
+
+    if (type != LOAD)
+        return;
+
+    uint64_t block_number = addr >> LOG2_BLOCK_SIZE;
+
+    /* check prefetch hit */
+    bool prefetch_hit = false;
+    if (cache_hit == 1) {
+        uint32_t set = temp->get_set(block_number);
+        uint32_t way = temp->get_way(block_number, set);
+        if (temp->block[set][way].prefetch == 1)
+            prefetch_hit = true;
+    }
+
+    /* check trigger access */
+    bool trigger_access = false;
+    if (cache_hit == 0 || prefetch_hit)
+        trigger_access = true;
+
+    if (trigger_access)
+        /* update MLOP with most recent trigger access */
+        L1D_PREF::prefetchers[temp->cpu].access(block_number);
+
+    /* issue prefetches */
+    L1D_PREF::prefetchers[temp->cpu].mark(block_number, L1D_PREF::State::ACCESS);
+    L1D_PREF::prefetchers[temp->cpu].prefetch(temp, block_number, sandbox, mode);
+
+    if (L1D_PREF::DEBUG_LEVEL >= 3) {
+        L1D_PREF::prefetchers[temp->cpu].log();
+        cerr << "=======================================" << dec << endl;
+    }
+
+    /* stats */
+    L1D_PREF::prefetchers[temp->cpu].track(block_number);
+}
+
+void mlop_l1d_prefetcher_cache_fill(CACHE * temp, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in) {
+    
+    if (temp->block[set][way].valid == 0)
+        return; /* no eviction */
+
+    uint64_t evicted_block_number = evicted_addr >> LOG2_BLOCK_SIZE;
+    L1D_PREF::prefetchers[temp->cpu].mark(evicted_block_number, L1D_PREF::State::INIT);
+
+    /* stats */
+    L1D_PREF::prefetchers[temp->cpu].track(evicted_block_number);
+}
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * end of MLOP
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * Bloom_Filter
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+bloom_filter* init (bloom_parameters paramet) // function to initialise bloom filter
+{
+ if (!paramet)
+ {
+    std::cout << "Error - Invalid set of bloom filter parameters!" << std::endl;
+ }
+ paramet.compute_optimal_parameters();
+ bloom_filter*  filter_123 = new bloom_filter(paramet);
+ return filter_123;
+}
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * end of Bloom_Filter
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+ * SANDBOX
+ *---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+void initialise_sandbox( float Bingo_SCORE_FINAL, float skid_SCORE_FINAL, float mlop_SCORE_FINAL, int cpu)
+{
+  //intialising sandbox parameters
+  
+  //all evaluation count (calls to each of the prefetcher) initialised to zero
+  sandbox[cpu].Bingo_EVAL_CNT = 0;
+  sandbox[cpu].skid_EVAL_CNT = 0;
+  sandbox[cpu].mlop_EVAL_CNT = 0;
+
+  //all scores initialised to zero
+  sandbox[cpu].Bingo_SCORE= 0;
+  sandbox[cpu].skid_SCORE= 0;
+  sandbox[cpu].mlop_SCORE= 0;
+
+  //cumilative score updated            
+  sandbox[cpu].Bingo_SCORE_old = Bingo_SCORE_FINAL;
+  sandbox[cpu].skid_SCORE_old = skid_SCORE_FINAL;
+  sandbox[cpu].mlop_SCORE_old = mlop_SCORE_FINAL;
+
+
+  sandbox[cpu].mode = EVAL;
+
+  sandbox[cpu].useful_prefetch_cnt =0; //no of usefull prefetches set to 0
+
+  sandbox[cpu].total_prefetch =1;      //no of total prefetches set to 1 . 
+                                       //This is initialised to 1 and not 0 as this term comes in the denominator 
+                                       //of useful_ratio so resetting it to 1 eliminates divide by zero error while 
+                                       //the error introduced is negligble
+
+  sandbox[cpu].useful_ratio =0;        // ratio useful prefetches reset to 0
+
+  // all bloom filters cleared
+  sandbox[cpu].Bingo_L1D_BFP->clear();
+  sandbox[cpu].skid_L1D_BFP->clear();
+  sandbox[cpu].mlop_L1D_BFP->clear();
+  sandbox[cpu].PF_BFP->clear();
+
+  //no of prediction made reset
+  sandbox[cpu].Bingo_PR_L1D_CNT = 1;
+  sandbox[cpu].skid_PR_L1D_CNT = 1;
+  sandbox[cpu].mlop_PR_L1D_CNT = 1;
+}
+
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+  cout << "check1" << endl;
+  static int first_time_pr_op[4]={1,1,1,1};
+  float Bingo_SCORE_FINAL = 0;
+  float skid_SCORE_FINAL=0;
+  float mlop_SCORE_FINAL=0;
+
+  // Multi core - first time flag
+
+  if(first_time_pr_op[0] && cpu == 0)
+  {
+    first_time_pr_op[cpu]=0;
+    initialise_sandbox(0,0,0,cpu);    // initialise sandbox on the first cache acces of 1st core
+  }
+  if(first_time_pr_op[1] && cpu == 1)
+  {
+    first_time_pr_op[cpu]=0;
+    initialise_sandbox(0,0,0,cpu);      // initialise sandbox on the first cache acces of 2nd core
+  }
+  if(first_time_pr_op[2] && cpu == 2)
+  {
+    first_time_pr_op[cpu]=0;
+    initialise_sandbox(0,0,0,cpu);      // initialise sandbox on the first cache acces  of 3rd core
+  }
+  if(first_time_pr_op[3] && cpu == 3)
+  {
+    first_time_pr_op[cpu]=0;
+    initialise_sandbox(0,0,0,cpu);       // initialise sandbox on the first cache acces of 4th core
+  }
+
+  if (sandbox[cpu].PF_BFP->contains(addr >> LOG2_BLOCK_SIZE  ))
+  {
+    sandbox[cpu].useful_prefetch_cnt ++;  // if the accssed address was prefetched increment no.of useful prefetches
+  }
+  if (sandbox[cpu].mode == EVAL)
+  {
+    //PAE (prefetch activation event) cache miss or prefetch hit 
+    bool evaluate_Bingo_selected = ( (sandbox[cpu].selected_prefetcher == BINGO ) && ( sandbox[cpu].Bingo_L1D_BFP->contains(addr >> LOG2_BLOCK_SIZE)) ); //prefetch hit in case of BINGO selected
+    bool evaluate_skid_selected = ( (sandbox[cpu].selected_prefetcher == skid ) && ( sandbox[cpu].skid_L1D_BFP->contains(addr >> LOG2_BLOCK_SIZE)) ); //prefetch hit in case of skid selected
+    bool evaluate_mlop_selected = ( (sandbox[cpu].selected_prefetcher == mlop ) && ( sandbox[cpu].mlop_L1D_BFP->contains(addr >> LOG2_BLOCK_SIZE)) ); //prefetch hit in case of mlop selected
+    bool evaluate  = !cache_hit || evaluate_Bingo_selected || evaluate_skid_selected || evaluate_mlop_selected; //PAE
+
+    if ( (sandbox[cpu].Bingo_EVAL_CNT <= EVAL_CNT) || (sandbox[cpu].skid_EVAL_CNT <= EVAL_CNT) || (sandbox[cpu].mlop_EVAL_CNT <= EVAL_CNT) ) //IF current phase not over
+    {
+        // call to each of the prefetchers in evaluation mode : only the selected prefetcher will add it's prediction to prefetch queue
+        // while all will add to their bloom filters
+        Bingo_l1d_prefetcher_operate(this, addr, ip, cache_hit, type, EVAL,cpu,sandbox[cpu].deg);
+        skid_l1d_prefetcher_operate(this, addr, ip, cache_hit, type, EVAL,cpu,sandbox[cpu].deg);
+        mlop_l1d_prefetcher_operate(this, addr, ip, cache_hit, type, EVAL,cpu,sandbox[cpu].deg);
+    }
+
+    if (sandbox[cpu].Bingo_EVAL_CNT <=EVAL_CNT) // run SPP for EVAL_CNT PAE's in current phase
+    {                 
+      if ( evaluate ) // cache miss or prefetch hit
+      {
+          if (sandbox[cpu].Bingo_L1D_BFP->contains(addr >> LOG2_BLOCK_SIZE))
+          {
+              sandbox[cpu].Bingo_SCORE += L2_SCORE_INC; // if miss (or prefetch hit) was predictrd  (added to  bloom filter) increament score
+          }
+          else 
+          {
+              sandbox[cpu].Bingo_SCORE -= SCORE_DEC; // if miss (or prefetch hit) was not added to any bloom filter decrease score
+          }                
+          sandbox[cpu].Bingo_EVAL_CNT +=1; // increase call counter for each PAE  
+      }
+    }
+    if (sandbox[cpu].skid_EVAL_CNT <=EVAL_CNT) // run SPP for EVAL_CNT PAE's in current phase
+    {                 
+      if ( evaluate ) // cache miss or prefetch hit
+      {
+          if (sandbox[cpu].skid_L1D_BFP->contains(addr >> LOG2_BLOCK_SIZE))
+          {
+              sandbox[cpu].skid_SCORE += L2_SCORE_INC; // if miss (or prefetch hit) was predictrd  (added to  bloom filter) increament score
+          }
+          else 
+          {
+              sandbox[cpu].skid_SCORE -= SCORE_DEC; // if miss (or prefetch hit) was not added to any bloom filter decrease score
+          }                
+          sandbox[cpu].skid_EVAL_CNT +=1; // increase call counter for each PAE  
+      }
+    }
+    if (sandbox[cpu].mlop_EVAL_CNT <= EVAL_CNT)  // run mlop in sandbox[cpu] (add prefetch request to bloom filter and NOT ISSUE IT) for EVAL_CNT misses
+    {   
+      if (evaluate)  // cache miss or prefetch hit
+      {
+        if (sandbox[cpu].mlop_L1D_BFP->contains(addr >> LOG2_BLOCK_SIZE))
+        {
+          sandbox[cpu].mlop_SCORE += L2_SCORE_INC;  // if miss (or prefetch hit) was prefetched to L2C (added to L2C bloom filter) increament score
+        }
+        else 
+        {
+          sandbox[cpu].mlop_SCORE -= SCORE_DEC; // if miss (or prefetch hit) was not added to any bloom filter decrease score
+        }
+        sandbox[cpu].mlop_EVAL_CNT +=1; // increase call counter for each PAE
+      }
+    }       
+    if(sandbox[cpu].Bingo_EVAL_CNT >EVAL_CNT && sandbox[cpu].skid_EVAL_CNT >EVAL_CNT && sandbox[cpu].mlop_EVAL_CNT >EVAL_CNT) //end curren phase when all prefetchers have been called EVAL_CNT times
+    {
+      Bingo_l1d_prefetcher_operate(this, addr, ip, cache_hit, type, BACK,cpu,sandbox[cpu].deg);
+      skid_l1d_prefetcher_operate(this, addr, ip, cache_hit, type, BACK,cpu,sandbox[cpu].deg); //call skid in BACK to keep its tables updated
+      mlop_l1d_prefetcher_operate(this, addr, ip, cache_hit, type, BACK,cpu,sandbox[cpu].deg);
+      //nextline has noo tables
+     
+      if ( sandbox[cpu].Bingo_SCORE_old == 0 || sandbox[cpu].skid_SCORE_old == 0 || sandbox[cpu].mlop_SCORE_old == 0)
+      {
+        //for first call of each phase cumilative score of each prefetcher the current score
+        Bingo_SCORE_FINAL = sandbox[cpu].Bingo_SCORE;
+        skid_SCORE_FINAL = sandbox[cpu].skid_SCORE;
+        mlop_SCORE_FINAL = sandbox[cpu].mlop_SCORE;
+      }
+      else
+      {   
+        //in subsequnt calls cumilative score calculated by giving (1-alpha_constant) weight to new score
+        Bingo_SCORE_FINAL = alpha_constant*sandbox[cpu].Bingo_SCORE_old + (1-alpha_constant)*sandbox[cpu].Bingo_SCORE;
+        skid_SCORE_FINAL = alpha_constant*sandbox[cpu].skid_SCORE_old + (1-alpha_constant)*sandbox[cpu].skid_SCORE;
+        mlop_SCORE_FINAL = alpha_constant*sandbox[cpu].mlop_SCORE_old + (1-alpha_constant)*sandbox[cpu].mlop_SCORE;
+      }
+
+
+      sandbox[cpu].useful_ratio = sandbox[cpu].useful_prefetch_cnt/sandbox[cpu].total_prefetch; // calculate useful prefetch to total prefetch ratio
+
+
+      
+      if ( skid_SCORE_FINAL > Bingo_SCORE_FINAL && skid_SCORE_FINAL > mlop_SCORE_FINAL  && sandbox[cpu].skid_SCORE >=MIN_SCORE) // kid has highest score in current eval cycle and it is higher than threshold
+      {
+        sandbox[cpu].selected_prefetcher  = skid;  //skid will be run in next phase
+      }
+      else if ( mlop_SCORE_FINAL > Bingo_SCORE_FINAL && mlop_SCORE_FINAL > skid_SCORE_FINAL  && sandbox[cpu].mlop_SCORE >=MIN_SCORE) // mlop has highest score in current eval cycle and it is higher than threshold
+      {
+        sandbox[cpu].selected_prefetcher  = mlop;  //mlop will be run in next phase
+      }
+      else if ( Bingo_SCORE_FINAL > mlop_SCORE_FINAL && Bingo_SCORE_FINAL > skid_SCORE_FINAL  && sandbox[cpu].Bingo_SCORE >=MIN_SCORE) // BINGO has highest score in current eval cycle and it is higher than threshold
+      {
+        sandbox[cpu].selected_prefetcher  = BINGO;  //BINGO will be run in next phase
+      } 
+      else if ( skid_SCORE_FINAL == mlop_SCORE_FINAL && skid_SCORE_FINAL == Bingo_SCORE_FINAL  && sandbox[cpu].skid_SCORE >=MIN_SCORE) // SPP and IP_stride have equal score in current eval cycle and it is higher than threshold
+      {
+        sandbox[cpu].selected_prefetcher  = skid;  //SPP will be run in next phase
+      }  
+      else // no score is greater than its threshold
+      {
+        sandbox[cpu].selected_prefetcher  = NONE;  //no prefetcher will be run in next phase or maybe mlop if it crosses the threshold
+      }
+
+/*
+   degree calculation
+        * If the useful/total prefetch ratio is greater than INC_DEG_THRESH_1 and degree is less than 8 increase degree
+        * If the useful/total prefetch ratio is greater than INC_DEG_THRESH_2  and degree is less than 4 increase degree
+        * If the useful/total prefetch ratio is less than DEC_DEG_THRESH  and degree is greater than 1 decrease degree
+*/
+
+      if (sandbox[cpu].selected_prefetcher != NONE)
+      {
+        if ((sandbox[cpu].useful_ratio > INC_DEG_THRESH_1 && sandbox[cpu].deg < MAX_DEGREE ) || (sandbox[cpu].useful_ratio > INC_DEG_THRESH_2 && sandbox[cpu].deg < MAX_DEGREE_2))
+        {
+          sandbox[cpu].deg ++;
+        }
+        else if (sandbox[cpu].useful_ratio < DEC_DEG_THRESH && sandbox[cpu].deg > 1)
+        {
+          sandbox[cpu].deg --;
+        }
+      }
+      initialise_sandbox(Bingo_SCORE_FINAL, skid_SCORE_FINAL, mlop_SCORE_FINAL, cpu);
+    }
+  }
+}   
+
+
+void CACHE::l1d_prefetcher_initialize()
+{
+  if(NUM_CPUS > 1) // Set MAX_DEGREE depending upon NUM_CPUS 
+  {
+    MAX_DEGREE = 4;
+    MAX_DEGREE_2 = 4;
+  }
+  else
+  {
+    MAX_DEGREE = 8; // Single core simulation provides better performance till degree = 8
+    MAX_DEGREE_2 = 4;
+  }
+  // passing sandbox parameters
+  sandbox[cpu].parameters.projected_element_count = BF_EST_CAP;
+  sandbox[cpu].parameters.false_positive_probability = BF_FPP;
+  sandbox[cpu].parameters.random_seed = 0xA5A5A5A5;
+  sandbox[cpu].PF_BFP = init(sandbox[cpu].parameters);
+  sandbox[cpu].skid_L1D_BFP = init(sandbox[cpu].parameters);
+  sandbox[cpu].mlop_L1D_BFP = init(sandbox[cpu].parameters);
+  sandbox[cpu].Bingo_L1D_BFP = init(sandbox[cpu].parameters);
+  sandbox[cpu].selected_prefetcher = NONE;
+
+  Bingo_l1d_prefetcher_initialize();
+  mlop_l1d_prefetcher_initialize(this);
+
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+  // MLOP final stats
+
+  cout << "=== CPU " << cpu << " L1D Prefetcher Statistics for MLOP ===" << endl;
+  L1D_PREF::prefetchers[cpu].print_stats();
+
+}
+
+void CACHE::l1d_prefetcher_cache_fill (uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  if(prefetch)
+  {
+    sandbox[cpu].PF_BFP->insert(addr >> LOG2_BLOCK_SIZE); // FUTURE : possible bookkeeping of prefetches this is used to count useful prefetches
+    sandbox[cpu].total_prefetch++; // maintaing a prefetch count 
+  }
+
+  mlop_l1d_prefetcher_cache_fill(this, addr, set, way, prefetch, evicted_addr, metadata_in);
+  Bingo_l1d_prefetcher_cache_fill(this, addr, set, way, prefetch, evicted_addr, metadata_in);
+}
